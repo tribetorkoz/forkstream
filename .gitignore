@@ -1,0 +1,20 @@
+node_modules/
+dist/
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+workspaces/projects/
+workspaces/ses_*/
+workspaces/transcripts/
+data/owner-token
+.env
+.env.*
+*.log
+
+# Skills distilled at runtime into the observed project (see server/skills/)
+.agents/skills/
+
+# Local Mergiraf binary (~82 MB) is installed separately; see README.
+# The server falls back to a system-wide `mergiraf` on PATH, then to git diff3.
+bin/mergiraf
+bin/mergiraf.exe
