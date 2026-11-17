@@ -14,7 +14,7 @@
 | محرر البث الحي و Unified Diff | `codemirror` 6 + `@codemirror/merge` (`unifiedMergeView`) | `github.com/codemirror/merge` |
 | شجرة الانقسام والدمج التفاعلية | `@xyflow/react` v12 | `github.com/xyflow/xyflow` |
 | تشغيل نماذج AI الحقيقية | `ai` (Vercel AI SDK v6 `streamText` + `tool`) + `@ai-sdk/anthropic`, `@ai-sdk/openai`, `@ai-sdk/google` | `github.com/vercel/ai` |
-| جسر خادم OpenCode | `POST /session/:id/fork` + `GET /global/event` SSE + `x-opencode-directory` | `github.com/idvxlab/VibeTrace` & `github.com/sst/opencode` |
+| جسر خادم OpenCode | `POST /api/session/:id/fork` + `POST /api/session/:id/prompt` + `GET /api/event` SSE (v2) مع احتياطي v1 (`/session`, `/global/event`) | `github.com/idvxlab/VibeTrace` & `github.com/sst/opencode` |
 | استخلاص المهارات من تدخلاتك | توليد ملفات `.agents/skills/<slug>/SKILL.md` (Context / Decision / Strategy) | `arXiv:2611.04466` (VibeTrace) & `agentskills.io` |
 
 ## التشغيل السريع
@@ -73,6 +73,26 @@ npm start
 ```
 
 افتح ForkStream على `http://127.0.0.1:3000`، ألغِ القفل برمز المالك، ثم من الإعدادات اختر OpenCode واترك العنوان `http://127.0.0.1:4096`. لا يقدر خادم Arena البعيد على الوصول إلى OpenCode الموجود على حاسوبك عبر هذا العنوان؛ لهذا الاختبار شغّل ForkStream محلياً أيضاً. `npm run test:opencode` يختبر عقد المحوّل محلياً بخادم محاكاة، ولا يستبدل اختبار الاتصال بإصدار OpenCode الذي لديك.
+
+### OpenCode 2.x (واجهة `/api/*` وكلمة مرور الخادم)
+
+`opencode v2` نقل الواجهة من `/session` و`/global/event` إلى `/api/*` ويطلب **HTTP Basic auth**. عند التشغيل يطبع سطراً مثل:
+
+```
+Server password: <كلمة-مرور-تُولَّد-مرة-واحدة>
+```
+
+انسخها والصقها في حقل **OpenCode server password (v2)** داخل نافذة الإعدادات (المستخدم الافتراضي `opencode`). تُحفظ في ذاكرة خادم ForkStream فقط، ولا تُكتب على القرص ولا تُعاد إلى المتصفح. تتغيّر الكلمة عند كل تشغيل جديد لـ `opencode serve`.
+
+المحوّل يكتشف الإصدار تلقائياً بفحص ترويسة `Content-Type` لطلب `GET /api/session?limit=1`: إن جاءت `application/json` يستخدم عقد v2، وإلا يعود إلى عقد v1. في v2 تحديداً:
+
+- إنشاء الجلسة: `POST /api/session` مع `location.directory` (دليل worktree).
+- الإرسال: `POST /api/session/:id/prompt` بالحقل `text`، وهو **يُدرِج الرسالة فقط** ولا ينتظر الوكيل؛ لذلك ينتظر ForkStream انتهاء التنفيذ عبر `POST /api/experimental/session/:id/wait` قبل إنشاء نقطة التحقق.
+- الشطر: `POST /api/session/:id/fork` بالحقل `before`، ثم `POST /api/session/:id/move` بالحقل `directory` لتوجيه الشطر إلى worktree المعزول.
+- الأحداث: `GET /api/event` بدلاً من `/global/event`.
+- الملفات المعدَّلة: `GET /api/session/:id/diff`.
+
+اترك حقل `Model` فارغاً أو بصيغة `provider/model` المعروفة لديك؛ الصيغة بلا شرطة مائلة تُهمَل ليعمل OpenCode بطرازه الافتراضي.
 
 ## بدء البناء الإنتاجي — الجزء 01
 

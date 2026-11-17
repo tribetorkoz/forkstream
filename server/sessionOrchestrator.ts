@@ -67,6 +67,7 @@ export class ForkStreamOrchestrator {
     fastModel: 'claude-haiku-4-5',
     baseUrl: '',
     opencodeUrl: 'http://127.0.0.1:4096',
+    opencodeUsername: 'opencode',
   }
 
   constructor(
@@ -77,27 +78,47 @@ export class ForkStreamOrchestrator {
     this.distiller = new SkillDistiller(projectRoot)
   }
 
-  getProviderConfig(): Omit<ProviderConfig, 'apiKey'> & { hasApiKey: boolean } {
-    const { apiKey, ...rest } = this.providerConfig
-    return { ...rest, hasApiKey: Boolean(apiKey && apiKey.trim().length > 0) }
+  getProviderConfig(): Omit<ProviderConfig, 'apiKey' | 'opencodePassword'> & {
+    hasApiKey: boolean
+    hasOpencodePassword: boolean
+  } {
+    const { apiKey, opencodePassword, ...rest } = this.providerConfig
+    return {
+      ...rest,
+      hasApiKey: Boolean(apiKey && apiKey.trim().length > 0),
+      hasOpencodePassword: Boolean(opencodePassword && opencodePassword.trim().length > 0),
+    }
   }
 
-  updateProviderConfig(next: Partial<ProviderConfig>): Omit<ProviderConfig, 'apiKey'> & { hasApiKey: boolean } {
+  updateProviderConfig(next: Partial<ProviderConfig>): Omit<ProviderConfig, 'apiKey' | 'opencodePassword'> & {
+    hasApiKey: boolean
+    hasOpencodePassword: boolean
+  } {
     this.providerConfig = {
       ...this.providerConfig,
       ...next,
       // Keep existing API key if caller sends empty placeholder while preserving key
       apiKey: next.apiKey !== undefined ? next.apiKey : this.providerConfig.apiKey,
+      opencodePassword:
+        next.opencodePassword !== undefined ? next.opencodePassword : this.providerConfig.opencodePassword,
     }
     return this.getProviderConfig()
+  }
+
+  /** Builds an adapter with the configured URL and optional v2 Basic auth pair. */
+  private openCodeAdapter(): OpenCodeAdapter {
+    return new OpenCodeAdapter({
+      baseUrl: this.providerConfig.opencodeUrl || 'http://127.0.0.1:4096',
+      username: this.providerConfig.opencodeUsername,
+      password: this.providerConfig.opencodePassword,
+    })
   }
 
   async getSystemInfo() {
     const tooling = await detectVcsTooling(this.projectRoot)
     let opencodeHealth: { ok: boolean; detail: string } | null = null
     if (this.providerConfig.mode === 'opencode' && this.providerConfig.opencodeUrl) {
-      const adapter = new OpenCodeAdapter({ baseUrl: this.providerConfig.opencodeUrl })
-      opencodeHealth = await adapter.checkHealth()
+      opencodeHealth = await this.openCodeAdapter().checkHealth()
     }
     return {
       tooling,
@@ -198,7 +219,9 @@ export class ForkStreamOrchestrator {
     const prompt = params.prompt?.trim() || scenario.defaultPromptAr
 
     const vcs = new SessionWorktreeManager(this.workspacesRoot, sessionId, this.projectRoot)
-    const rootCommit = await vcs.initialize()
+    const rootCommit = await vcs.initialize({
+      seedFrom: mode === 'sandbox' ? undefined : this.projectRoot,
+    })
     const tooling = vcs.getTooling()
 
     let managedRef!: ManagedSession
@@ -701,27 +724,100 @@ export class ForkStreamOrchestrator {
   }
 
   private async executeOpenCodeBuilder(managed: ManagedSession): Promise<void> {
-    const adapter = new OpenCodeAdapter({
-      baseUrl: this.providerConfig.opencodeUrl || 'http://127.0.0.1:4096',
-    })
+    const { sessionId } = managed.snapshot
+    const adapter = this.openCodeAdapter()
     const health = await adapter.checkHealth()
     if (!health.ok) {
       throw new Error(
         `OpenCode server unreachable at ${this.providerConfig.opencodeUrl} (${health.detail}). Start 'opencode serve --port 4096' or switch to Sandbox / LLM API mode.`,
       )
     }
-    const ocSession = await adapter.createSession(managed.vcs.mainDir, managed.snapshot.title)
+
+    managed.snapshot.currentBuilderAction = 'Opening OpenCode session…'
+    managed.snapshot.currentBuilderActionAr = 'جارٍ فتح جلسة OpenCode…'
+    this.broadcastSnapshot(managed)
+
+    const ocSession = await adapter.createSession(
+      managed.vcs.mainDir,
+      managed.snapshot.title,
+      undefined,
+      this.providerConfig.model,
+    )
     managed.opencodeSessionId = ocSession.id
-    adapter.subscribeEvents((ev) => {
-      this.bus.emitCustom(managed.snapshot.sessionId, 'opencode.event', ev)
-    }, managed.abortController.signal)
+    managed.snapshot.totalSteps = 1
+
+    // Live telemetry from the OpenCode event stream (tool calls, execution state).
+    adapter.subscribeEvents(
+      (ev) => {
+        const type = typeof ev.type === 'string' ? ev.type : ''
+        if (type === 'session.execution.started') {
+          managed.snapshot.currentBuilderAction = 'OpenCode agent is working…'
+          managed.snapshot.currentBuilderActionAr = 'وكيل OpenCode يعمل الآن…'
+          this.broadcastSnapshot(managed)
+        } else if (type === 'session.execution.succeeded') {
+          managed.snapshot.currentBuilderAction = 'OpenCode agent finished the task'
+          managed.snapshot.currentBuilderActionAr = 'أنهى وكيل OpenCode المهمة'
+          this.broadcastSnapshot(managed)
+        } else if (type === 'session.execution.failed') {
+          managed.snapshot.currentBuilderAction = 'OpenCode agent reported a failed execution'
+          managed.snapshot.currentBuilderActionAr = 'أبلغ وكيل OpenCode عن فشل في التنفيذ'
+          this.broadcastSnapshot(managed)
+        }
+        this.bus.emitCustom(sessionId, 'opencode.event', ev)
+      },
+      managed.abortController.signal,
+    )
 
     await adapter.sendPrompt(
       ocSession.id,
       managed.vcs.mainDir,
-      `${managed.snapshot.prompt}${this.distiller.buildSkillPromptBlock()}`,
+      `Work only inside the current working directory. Do not read or write files outside it.\n\n${managed.snapshot.prompt}${this.distiller.buildSkillPromptBlock()}`,
       this.providerConfig.model,
     )
+
+    // `prompt` only enqueues the message on v2 — block until the agent loop is idle
+    // so the checkpoint below captures the files the agent actually wrote.
+    try {
+      await adapter.waitForIdle(ocSession.id, managed.abortController.signal)
+    } catch (err) {
+      if (managed.abortController.signal.aborted) return
+      throw err
+    }
+    if (managed.abortController.signal.aborted) return
+
+    const diffs = await adapter.getDiff(ocSession.id)
+    for (const entry of diffs) {
+      const absolute = path.isAbsolute(entry.file) ? entry.file : path.resolve(managed.vcs.mainDir, entry.file)
+      const relPath = path.relative(managed.vcs.mainDir, absolute).split(path.sep).join('/')
+      try {
+        const stat = await fs.promises.stat(absolute)
+        if (stat.isFile() && stat.size <= 512 * 1024) {
+          const content = await fs.promises.readFile(absolute, 'utf8')
+          managed.observer.recordFileMutation('main', relPath, content)
+        }
+      } catch {
+        // File deleted by the agent — nothing to snapshot.
+      }
+      this.pushActivity(managed, {
+        agentId: 'builder',
+        agentRole: 'builder',
+        eventType: 'TOOL_CALL_RESULT',
+        message: `${entry.status} ${relPath} (+${entry.additions}/-${entry.deletions})`,
+        messageAr: `${entry.status} ${relPath} (+${entry.additions}/-${entry.deletions})`,
+        filePath: relPath,
+        badge: 'OPENCODE',
+      })
+    }
+    managed.snapshot.totalSteps = Math.max(1, diffs.length)
+    this.bus.emitToolCall(
+      sessionId,
+      `tc_opencode_${Date.now().toString(36)}`,
+      'opencode.run',
+      JSON.stringify({ session: ocSession.id, files: diffs.map((d) => d.file) }),
+      `OpenCode modified ${diffs.length} file(s)`,
+    )
+    this.broadcastSnapshot(managed)
+
     const commit = await managed.vcs.commitMainCheckpoint('feat: opencode primary task')
     if (commit) {
       const prev = this.latestMainCheckpoint(managed)
@@ -741,7 +837,33 @@ export class ForkStreamOrchestrator {
         timestamp: Date.now(),
         diffPatch: commit.diffPatch,
       })
+      managed.observer.recordCheckpoint(
+        `cp_${managed.snapshot.checkpoints.length - 1}`,
+        commit.commitHash,
+      )
       managed.snapshot.completedSteps = managed.snapshot.totalSteps
+      this.pushActivity(managed, {
+        agentId: 'builder',
+        agentRole: 'builder',
+        eventType: 'TOOL_CALL_RESULT',
+        message: `OpenCode checkpoint (+${commit.linesAdded}/-${commit.linesRemoved})`,
+        messageAr: `نقطة تحقق OpenCode (+${commit.linesAdded}/-${commit.linesRemoved})`,
+        commitHash: commit.shortHash,
+        badge: 'COMMIT',
+      })
+      this.broadcastSnapshot(managed)
+      await this.flushSessionPersistence(managed)
+    } else {
+      managed.snapshot.completedSteps = managed.snapshot.totalSteps
+      this.pushActivity(managed, {
+        agentId: 'builder',
+        agentRole: 'builder',
+        eventType: 'TOOL_CALL_RESULT',
+        message: 'OpenCode finished without changing any file',
+        messageAr: 'انتهى OpenCode دون تغيير أي ملف',
+        badge: 'OPENCODE',
+      })
+      this.broadcastSnapshot(managed)
     }
   }
 
@@ -878,18 +1000,48 @@ export class ForkStreamOrchestrator {
         })
         fork.filesModified = res.filesModified
       } else if (managed.snapshot.mode === 'opencode' && managed.opencodeSessionId) {
-        const adapter = new OpenCodeAdapter({
-          baseUrl: this.providerConfig.opencodeUrl || 'http://127.0.0.1:4096',
-        })
+        const adapter = this.openCodeAdapter()
         const forkedSession = await adapter.forkSession(managed.opencodeSessionId, {
           directory: fork.worktreePath,
         })
+        // v2 stores the working directory on the session itself, so point the
+        // forked context at the isolated Git worktree before prompting it.
+        await adapter.moveSession(forkedSession.id, fork.worktreePath)
         await adapter.sendPrompt(
           forkedSession.id,
           fork.worktreePath,
           `Apply this targeted fix cleanly: ${fork.userPrompt}`,
           this.providerConfig.fastModel || this.providerConfig.model,
         )
+        // Same v2 rule as the builder: wait for the forked agent loop to go idle
+        // before committing, otherwise the fork branch is committed empty.
+        try {
+          await adapter.waitForIdle(forkedSession.id, managed.abortController.signal)
+        } catch {
+          // Best-effort: a wait timeout must not kill the merge pipeline.
+        }
+        const forkDiff = await adapter.getDiff(forkedSession.id)
+        if (forkDiff.length) {
+          fork.filesModified = forkDiff.map((entry) => entry.file)
+          for (const entry of forkDiff) {
+            const absolute = path.isAbsolute(entry.file)
+              ? entry.file
+              : path.resolve(fork.worktreePath, entry.file)
+            const relPath = path.relative(fork.worktreePath, absolute).split(path.sep).join('/')
+            try {
+              const stat = await fs.promises.stat(absolute)
+              if (stat.isFile() && stat.size <= 512 * 1024) {
+                const content = await fs.promises.readFile(absolute, 'utf8')
+                managed.observer.recordFileMutation(fork.id, relPath, content)
+              }
+            } catch {
+              // Deleted by the fork agent.
+            }
+          }
+          fork.currentAction = `OpenCode fork agent edited ${forkDiff.length} file(s)`
+          fork.currentActionAr = `وكيل الشطر عدّل ${forkDiff.length} ملف`
+          this.broadcastSnapshot(managed)
+        }
       } else {
         await sleep(1400)
         const sandboxRes = await applySandboxForkIntervention({
@@ -965,7 +1117,9 @@ export class ForkStreamOrchestrator {
           }),
       )
 
-      fork.status =
+      // The terminal status is published only after SUBAGENT_FINISHED is emitted
+      // (see below), so a client that waits for `merged` can never miss the event.
+      const resolvedStatus: AgentFork['status'] =
         mergeOutcome.strategy === 'ai-diff3-resolved' ? 'conflict_resolved' : 'merged'
       fork.mergeCommitHash = mergeOutcome.commitHash
       fork.mergeStrategy = mergeOutcome.strategy
@@ -1026,6 +1180,7 @@ export class ForkStreamOrchestrator {
         strategy: mergeOutcome.strategy,
         skillId: skill.id,
       })
+      fork.status = resolvedStatus
 
       this.pushActivity(managed, {
         agentId: fork.id,

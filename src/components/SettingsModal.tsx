@@ -5,7 +5,10 @@ import type { ExecutionMode, LLMProviderId, ProviderConfig } from '../../shared/
 
 interface SettingsModalProps {
   lang: Lang
-  current: Omit<ProviderConfig, 'apiKey'> & { hasApiKey: boolean }
+  current: Omit<ProviderConfig, 'apiKey' | 'opencodePassword'> & {
+    hasApiKey: boolean
+    hasOpencodePassword: boolean
+  }
   onSave: (next: Partial<ProviderConfig>) => Promise<void>
   onClose: () => void
 }
@@ -27,6 +30,7 @@ export function SettingsModal({ lang, current, onSave, onClose }: SettingsModalP
   const [fastModel, setFastModel] = useState(current.fastModel || '')
   const [baseUrl, setBaseUrl] = useState(current.baseUrl || '')
   const [opencodeUrl, setOpencodeUrl] = useState(current.opencodeUrl || 'http://127.0.0.1:4096')
+  const [opencodePassword, setOpencodePassword] = useState('')
   const [saving, setSaving] = useState(false)
 
   const handleProviderChange = (p: LLMProviderId) => {
@@ -51,6 +55,7 @@ export function SettingsModal({ lang, current, onSave, onClose }: SettingsModalP
         opencodeUrl,
       }
       if (apiKey.trim()) payload.apiKey = apiKey.trim()
+      if (opencodePassword.trim()) payload.opencodePassword = opencodePassword.trim()
       await onSave(payload)
       onClose()
     } finally {
@@ -206,6 +211,25 @@ export function SettingsModal({ lang, current, onSave, onClose }: SettingsModalP
                   onChange={(e) => setOpencodeUrl(e.target.value)}
                   className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
                 />
+              </div>
+              <div>
+                <label className="block text-slate-400 mb-1">
+                  {lang === 'ar' ? 'كلمة مرور خادم OpenCode (v2)' : 'OpenCode server password (v2)'}
+                </label>
+                <input
+                  dir="ltr"
+                  type="password"
+                  autoComplete="off"
+                  value={opencodePassword}
+                  onChange={(e) => setOpencodePassword(e.target.value)}
+                  placeholder={current.hasOpencodePassword ? '••••••••••• (محفوظة / saved)' : 'server password'}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
+                />
+                <p className="mt-1 text-xs text-slate-500">
+                  {lang === 'ar'
+                    ? 'يطبعها `opencode serve` مرة واحدة عند التشغيل. تُحفظ في ذاكرة الخادم فقط ولا تُكتب على القرص.'
+                    : 'Printed once by `opencode serve` at startup. Kept in server memory only, never written to disk.'}
+                </p>
               </div>
               <div>
                 <label className="block text-slate-400 mb-1">Model (provider/model, optional)</label>

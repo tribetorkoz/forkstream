@@ -57,7 +57,8 @@ try {
 } finally {
   const { closeDatabase } = await import('../server/db/database.js')
   await closeDatabase()
-  await fs.rm(temp, { recursive: true, force: true })
+  // Windows can hold the WAL/SHM handles a moment past closeDatabase().
+  await fs.rm(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
   delete process.env.FORKSTREAM_API_TOKEN
   delete process.env.FORKSTREAM_DB_PATH
   delete process.env.FORKSTREAM_PROJECTS_ROOT

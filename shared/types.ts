@@ -19,6 +19,9 @@ export interface ProviderConfig {
   fastModel?: string
   baseUrl?: string
   opencodeUrl?: string
+  /** `opencode serve` v2 prints a generated server password; these hold the Basic auth pair. */
+  opencodeUsername?: string
+  opencodePassword?: string
 }
 
 export type SessionStatus = 'idle' | 'running' | 'paused' | 'completed' | 'error' | 'interrupted'

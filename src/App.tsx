@@ -24,7 +24,10 @@ interface SystemInfoResponse {
     mergirafPath: string | null
     mergirafVersion: string | null
   }
-  provider: Omit<ProviderConfig, 'apiKey'> & { hasApiKey: boolean }
+  provider: Omit<ProviderConfig, 'apiKey' | 'opencodePassword'> & {
+    hasApiKey: boolean
+    hasOpencodePassword: boolean
+  }
   scenarios: ScenarioPreset[]
   skillsCount: number
 }

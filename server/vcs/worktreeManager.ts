@@ -173,6 +173,50 @@ function countPatchStats(patch: string): { linesAdded: number; linesRemoved: num
   return { linesAdded, linesRemoved }
 }
 
+/** Directories never copied into a session workspace (secrets, binaries, recursion). */
+const SEED_SKIP_DIRS = new Set(['.git', 'node_modules', 'dist', 'data', 'workspaces', '.agents'])
+/** Individual files never copied into a session workspace. */
+const SEED_SKIP_FILES = new Set(['bin/mergiraf', 'bin/mergiraf.exe'])
+const SEED_MAX_FILE_BYTES = 2 * 1024 * 1024
+const SEED_MAX_FILES = 5000
+
+function seedWorkspace(sourceRoot: string, targetRoot: string): number {
+  let copied = 0
+  const walk = (relative: string): void => {
+    if (copied >= SEED_MAX_FILES) return
+    const absolute = path.join(sourceRoot, relative)
+    let entries: fs.Dirent[]
+    try {
+      entries = fs.readdirSync(absolute, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (copied >= SEED_MAX_FILES) return
+      const rel = relative ? `${relative}/${entry.name}` : entry.name
+      const normalized = rel.split(path.sep).join('/')
+      if (entry.isDirectory()) {
+        if (SEED_SKIP_DIRS.has(entry.name)) continue
+        fs.mkdirSync(path.join(targetRoot, rel), { recursive: true })
+        walk(rel)
+        continue
+      }
+      if (!entry.isFile() || SEED_SKIP_FILES.has(normalized)) continue
+      try {
+        const stat = fs.statSync(path.join(sourceRoot, rel))
+        if (stat.size > SEED_MAX_FILE_BYTES) continue
+        fs.mkdirSync(path.dirname(path.join(targetRoot, rel)), { recursive: true })
+        fs.copyFileSync(path.join(sourceRoot, rel), path.join(targetRoot, rel))
+        copied++
+      } catch {
+        // Skip unreadable/locked files rather than failing the whole session.
+      }
+    }
+  }
+  walk('')
+  return copied
+}
+
 export class SessionWorktreeManager {
   readonly sessionRoot: string
   readonly mainDir: string
@@ -202,10 +246,14 @@ export class SessionWorktreeManager {
     await runGit(this.mainDir, ['status', '--porcelain'])
   }
 
-  async initialize(): Promise<CommitResult> {
+  async initialize(options?: { seedFrom?: string }): Promise<CommitResult> {
     this.tooling = await detectVcsTooling(this.projectRoot)
     fs.mkdirSync(this.mainDir, { recursive: true })
     fs.mkdirSync(this.forksRoot, { recursive: true })
+
+    // Real agents (LLM API / OpenCode) need the actual project files to edit; the
+    // sandbox engine fabricates its own content, so it keeps an empty scaffold.
+    if (options?.seedFrom) seedWorkspace(options.seedFrom, this.mainDir)
 
     await runGit(this.mainDir, ['init', '-b', 'main'])
     await runGit(this.mainDir, ['config', 'user.name', 'ForkStream Agent'])
